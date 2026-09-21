@@ -295,26 +295,21 @@ def save_output(data:bytes,target:Path,watermark:bool):
 
 # Photoroom "listing images for clothing and apparel" tutorial:
 # https://docs.photoroom.com/tutorials/how-to-create-listing-images-for-clothing-and-apparel
-# Photoroom does not invent angles that were never photographed (no side/back view from a
-# single photo) — it restyles a real photo. So every ANGLE shown to buyers comes from a real
-# seller photo (front.jpg, detail.jpg = back). ghostMannequin.mode normalizes almost any input
-# toward a front-presentable collared shape, so it is only trustworthy on the FRONT photo — on
-# a back photo it can render a collar that was never actually visible from behind. The back
-# photo therefore gets two orientation-preserving styles instead (flat lay + plain cutout),
-# never ghost mannequin.
-PHOTOROOM_FRONT_STYLES=[
-    {'key':'flat','suffix':'다림질','params':{'flatLay.mode':'ai.auto','background.color':'FFFFFF'}},
-    {'key':'ghost','suffix':'투명 마네킹','params':{'ghostMannequin.mode':'ai.auto','background.color':'FFFFFF'}},
-]
+# Fixed listing sequence: front ironed, back ironed, front ghost mannequin, male model,
+# female model, then a same-session composite of the two model shots side by side ("couple").
+# Photoroom's v2/edit has no multi-person virtualModel mode — a single call cannot put two
+# people in one photo — so the "couple" shot is our own composite of the two real Photoroom
+# renders, not a native Photoroom feature; it is labelled as a composite for that reason.
 PHOTOROOM_FALLBACK_PARAMS={'removeBackground':'true','background.color':'FFFFFF','padding':'0.1','shadow.mode':'ai.soft'}
-PHOTOROOM_BACK_STYLES=[
-    {'key':'flat','suffix':'다림질','params':{'flatLay.mode':'ai.auto','background.color':'FFFFFF'}},
-    {'key':'studio','suffix':'스튜디오 컷','params':PHOTOROOM_FALLBACK_PARAMS},
-]
+PHOTOROOM_FLAT_PARAMS={'flatLay.mode':'ai.auto','background.color':'FFFFFF'}
+PHOTOROOM_GHOST_PARAMS={'ghostMannequin.mode':'ai.auto','background.color':'FFFFFF'}
+PHOTOROOM_MODEL_SCENE='studio'  # keep both model shots on the same plain backdrop for a matching pair
+PHOTOROOM_MODEL_PARAMS_MALE={'removeBackground':'false','referenceBox':'originalImage','virtualModel.mode':'ai.auto','virtualModel.model.preset.name':'jackson','virtualModel.scene.preset.name':PHOTOROOM_MODEL_SCENE,'virtualModel.pose':'standing'}
+PHOTOROOM_MODEL_PARAMS_FEMALE={'removeBackground':'false','referenceBox':'originalImage','virtualModel.mode':'ai.auto','virtualModel.model.preset.name':'avery','virtualModel.scene.preset.name':PHOTOROOM_MODEL_SCENE,'virtualModel.pose':'standing'}
 
 def photoroom_edit(data:bytes,params:dict)->bytes:
     """One call to Photoroom's Image Editing API. Raises on failure; caller decides whether
-    that's fatal for the whole job or just for this one angle."""
+    that's fatal for the whole job or just for this one image."""
     import httpx
     response=httpx.post(
         'https://image-api.photoroom.com/v2/edit',
@@ -334,6 +329,18 @@ def photoroom_style(data:bytes,params:dict)->bytes:
     except Exception as exc:
         LOG.warning('Photoroom style call failed, falling back to plain cutout (%s)',type(exc).__name__)
         return photoroom_edit(data,PHOTOROOM_FALLBACK_PARAMS)
+
+def compose_couple_shot(male_jpeg:bytes,female_jpeg:bytes)->bytes:
+    """Our own side-by-side composite of the two real model renders. Not a Photoroom feature —
+    Photoroom cannot put two people in one image from a single call."""
+    with Image.open(io.BytesIO(male_jpeg)) as m,Image.open(io.BytesIO(female_jpeg)) as f:
+        m=m.convert('RGB');f=f.convert('RGB')
+        h=min(m.height,f.height)
+        m=m.resize((int(m.width*h/m.height),h));f=f.resize((int(f.width*h/f.height),h))
+        gap=24
+        canvas=Image.new('RGB',(m.width+gap+f.width,h),'#FFFFFF')
+        canvas.paste(m,(0,0));canvas.paste(f,(m.width+gap,0))
+        out=io.BytesIO();canvas.save(out,'JPEG',quality=93);return out.getvalue()
 
 def run_job(job):
     try:
@@ -360,38 +367,48 @@ def run_job(job):
                 encoded=output.data[0].b64_json
                 if not encoded:raise ValueError('No image output')
                 data=image_bytes(base64.b64decode(encoded));path=folder/'ai-detail.jpg';path.write_bytes(data);sources.append(path);generated=True
-        angle_labels=['정면','뒷면','AI 디테일 이미지 · 검토 필요']
         outputs=[];photoroomOK=False
         if PHOTOROOM_KEY:
-            # front.jpg and detail.jpg (= back) each get BOTH styles: a flat "ironed" cutout
-            # and a filled-out ghost mannequin. Every alt text spells out which source photo
-            # (정면/뒷면) it came from, since a ghost-mannequin back can look front-like once
-            # it's filled out — the label is what tells them apart, not the silhouette.
-            for i,path in enumerate(sources[:2]):
-                data=path.read_bytes()
-                for style in (PHOTOROOM_FRONT_STYLES if i==0 else PHOTOROOM_BACK_STYLES):
-                    try:img=photoroom_style(data,style['params'])
-                    except Exception as exc:LOG.warning('Photoroom %s/%s failed for %s (%s)',angle_labels[i],style['key'],job,type(exc).__name__);continue
-                    name=f"photoroom-{i}-{style['key']}.jpg";target=folder/name
-                    try:save_output(img,target,watermark=row['plan']=='free')
-                    except Exception as exc:LOG.warning('Photoroom output %s/%s could not be saved for %s (%s)',i,style['key'],job,type(exc).__name__);continue
-                    outputs.append({'name':name,'alt':f"{angle_labels[i]} · {style['suffix']}",'kind':'main' if i==0 else 'detail'});photoroomOK=True
-            if len(sources)>2:
-                try:img=photoroom_style(sources[2].read_bytes(),PHOTOROOM_FRONT_STYLES[1]['params'])
-                except Exception as exc:LOG.warning('Photoroom AI-detail pass failed for %s (%s)',job,type(exc).__name__)
+            front_bytes=sources[0].read_bytes();back_bytes=sources[1].read_bytes()
+            # Fixed order: front ironed, back ironed, front ghost mannequin, male model,
+            # female model, then our own side-by-side composite of the two model shots.
+            fixed_steps=[
+                ('0-flat',front_bytes,PHOTOROOM_FLAT_PARAMS,'정면 · 다림질','main'),
+                ('1-flat',back_bytes,PHOTOROOM_FLAT_PARAMS,'뒷면 · 다림질','detail'),
+                ('0-ghost',front_bytes,PHOTOROOM_GHOST_PARAMS,'고스트 마네킹','angle'),
+            ]
+            for key,data,params,alt,kind in fixed_steps:
+                try:img=photoroom_style(data,params)
+                except Exception as exc:LOG.warning('Photoroom %s failed for %s (%s)',key,job,type(exc).__name__);continue
+                name=f'photoroom-{key}.jpg';target=folder/name
+                try:save_output(img,target,watermark=row['plan']=='free')
+                except Exception as exc:LOG.warning('Photoroom output %s could not be saved for %s (%s)',key,job,type(exc).__name__);continue
+                outputs.append({'name':name,'alt':alt,'kind':kind});photoroomOK=True
+            # Model shots: Photoroom's virtualModel feature, no plain-cutout fallback (a failed
+            # call here just means no model shot, not a broken/ugly cutout of a person).
+            model_jpegs={}
+            for key,params,alt in (('male',PHOTOROOM_MODEL_PARAMS_MALE,'남자 착용컷'),('female',PHOTOROOM_MODEL_PARAMS_FEMALE,'여자 착용컷')):
+                try:img=photoroom_edit(front_bytes,params)
+                except Exception as exc:LOG.warning('Photoroom virtual model %s failed for %s (%s)',key,job,type(exc).__name__);continue
+                name=f'photoroom-model-{key}.jpg';target=folder/name
+                try:save_output(img,target,watermark=row['plan']=='free')
+                except Exception as exc:LOG.warning('Photoroom model output %s could not be saved for %s (%s)',key,job,type(exc).__name__);continue
+                model_jpegs[key]=target.read_bytes()
+                outputs.append({'name':name,'alt':alt,'kind':'model'});photoroomOK=True
+            if 'male' in model_jpegs and 'female' in model_jpegs:
+                try:composite=compose_couple_shot(model_jpegs['male'],model_jpegs['female'])
+                except Exception as exc:LOG.warning('Couple composite failed for %s (%s)',job,type(exc).__name__)
                 else:
-                    name='photoroom-2-ghost.jpg';target=folder/name
-                    try:save_output(img,target,watermark=row['plan']=='free')
-                    except Exception as exc:LOG.warning('Photoroom AI-detail output could not be saved for %s (%s)',job,type(exc).__name__)
-                    else:outputs.append({'name':name,'alt':angle_labels[2],'kind':'ai-detail'});photoroomOK=True
+                    name='photoroom-model-couple.jpg';target=folder/name;target.write_bytes(composite)
+                    outputs.append({'name':name,'alt':'커플 착용컷 (합성 이미지)','kind':'model'})
         if not photoroomOK:
             # No Photoroom key, or every Photoroom call failed: fall back to the seller's raw
             # photos so the listing is never left empty.
-            for i,path in enumerate(sources):
+            for i,path in enumerate(sources[:2]):
                 name=f'output-{i}.jpg';target=folder/name
                 if row['plan']=='free':add_watermark(path,target)
                 else:target.write_bytes(path.read_bytes())
-                outputs.append({'name':name,'alt':(('상품 '+angle_labels[i]) if i<2 else angle_labels[2]),'kind':'main' if i==0 else ('ai-detail' if i==2 else 'detail')})
+                outputs.append({'name':name,'alt':'상품 '+('정면' if i==0 else '뒷면'),'kind':'main' if i==0 else 'detail'})
         result={'product':product,'description':description,'visibleFeatures':features,'needsConfirmation':confirm,'outputs':outputs,'imageGenerated':generated,'photoroomViews':photoroomOK,'mock':MODE=='mock','plan':row['plan']}
         with db() as c:c.execute("UPDATE jobs SET status='completed',result=? WHERE id=?",(json.dumps(result,ensure_ascii=False),job))
     except Exception as exc:
