@@ -26,6 +26,7 @@ MODE=os.getenv('GENERATION_MODE','ai')
 TEXT_MODEL=os.getenv('TEXT_MODEL','gpt-4.1-mini')
 IMAGE_MODEL=os.getenv('IMAGE_MODEL','gpt-image-1.5')
 IMAGE_EDIT=os.getenv('AI_IMAGE_EDIT','true').lower()=='true'
+PHOTOROOM_KEY=os.getenv('PHOTOROOM_API_KEY','')
 MAX_FILE=10*1024*1024
 Image.MAX_IMAGE_PIXELS=32_000_000
 warnings.simplefilter('error',Image.DecompressionBombWarning)
@@ -270,16 +271,62 @@ async def generate(front:UploadFile=File(...),detail:UploadFile=File(...),produc
     POOL.submit(run_job,job)
     return {'jobId':job,'status':'queued','message':'제작 요청이 접수됐습니다.'}
 
+def watermark_image(im:Image.Image)->Image.Image:
+    im=im.convert('RGB')
+    draw=ImageDraw.Draw(im)
+    try:font=ImageFont.truetype('DejaVuSans.ttf',max(16,im.width//35))
+    except OSError:font=ImageFont.load_default(size=max(16,im.width//35))
+    text='THREAD MARKET / FREE'
+    box=draw.textbbox((0,0),text,font=font);w=box[2]-box[0];h=box[3]-box[1]
+    draw.rectangle((0,im.height-h-36,im.width,im.height),fill='#edf0e6')
+    draw.text(((im.width-w)/2,im.height-h-25),text,fill='#414934',font=font)
+    return im
+
 def add_watermark(source:Path,target:Path):
-    with Image.open(source).convert('RGB') as im:
-        draw=ImageDraw.Draw(im)
-        try:font=ImageFont.truetype('DejaVuSans.ttf',max(16,im.width//35))
-        except OSError:font=ImageFont.load_default(size=max(16,im.width//35))
-        text='THREAD MARKET / FREE'
-        box=draw.textbbox((0,0),text,font=font);w=box[2]-box[0];h=box[3]-box[1]
-        draw.rectangle((0,im.height-h-36,im.width,im.height),fill='#edf0e6')
-        draw.text(((im.width-w)/2,im.height-h-25),text,fill='#414934',font=font)
+    with Image.open(source) as im:watermark_image(im).save(target,'JPEG',quality=93)
+
+def save_output(data:bytes,target:Path,watermark:bool):
+    """Normalize arbitrary image bytes (a local source file or a Photoroom result, which may
+    be a transparent PNG) into a flattened JPEG, optionally stamping the free-plan watermark."""
+    with Image.open(io.BytesIO(data)) as im:
+        im=im.convert('RGB')
+        if watermark:im=watermark_image(im)
         im.save(target,'JPEG',quality=93)
+
+# Photoroom "listing images for clothing and apparel" tutorial:
+# https://docs.photoroom.com/tutorials/how-to-create-listing-images-for-clothing-and-apparel
+# One product photo in -> several angle/format variants out, each a separate v2/edit call.
+# background.color is fixed to white on every call so results stay flattenable JPEGs that
+# fit the rest of this pipeline (watermarking, single-file storage, etc.).
+PHOTOROOM_VIEWS=[
+    {'key':'studio','alt':'스튜디오 컷 · 배경 제거','params':{'removeBackground':'true','background.color':'FFFFFF','padding':'0.1','shadow.mode':'ai.soft'}},
+    {'key':'flatlay','alt':'플랫레이 · 위에서 본 모습','params':{'flatLay.mode':'ai.auto','background.color':'FFFFFF'}},
+    {'key':'ghost','alt':'고스트 마네킹 · 핏 강조','params':{'ghostMannequin.mode':'ai.auto','background.color':'FFFFFF'}},
+]
+
+def photoroom_edit(data:bytes,params:dict)->bytes:
+    """One call to Photoroom's Image Editing API. Raises on failure; caller decides whether
+    that's fatal for the whole job or just for this one angle."""
+    import httpx
+    response=httpx.post(
+        'https://image-api.photoroom.com/v2/edit',
+        headers={'x-api-key':PHOTOROOM_KEY},
+        files={'imageFile':('image.jpg',data,'image/jpeg')},
+        data=params,
+        timeout=90,
+    )
+    response.raise_for_status()
+    return response.content
+
+def photoroom_generate_views(data:bytes)->list[tuple[str,str,bytes]]:
+    """Runs the source photo through every configured Photoroom view (studio cutout, flat
+    lay, ghost mannequin). Each view is independent: one failing (rate limit, unsupported
+    image, upstream error) never blocks the others or the rest of the job."""
+    out=[]
+    for view in PHOTOROOM_VIEWS:
+        try:out.append((view['key'],view['alt'],photoroom_edit(data,view['params'])))
+        except Exception as exc:LOG.warning('Photoroom view %s failed (%s)',view['key'],type(exc).__name__)
+    return out
 
 def run_job(job):
     try:
@@ -312,7 +359,14 @@ def run_job(job):
             if row['plan']=='free':add_watermark(path,target)
             else:target.write_bytes(path.read_bytes())
             outputs.append({'name':name,'alt':['상품 정면','디테일 원본','AI 디테일 이미지 · 검토 필요'][i],'kind':'main' if i==0 else 'detail'})
-        result={'product':product,'description':description,'visibleFeatures':features,'needsConfirmation':confirm,'outputs':outputs,'imageGenerated':generated,'mock':MODE=='mock','plan':row['plan']}
+        photoroomViews=False
+        if PHOTOROOM_KEY:
+            for key,alt,img_bytes in photoroom_generate_views(sources[0].read_bytes()):
+                name=f'photoroom-{key}.jpg';target=folder/name
+                try:save_output(img_bytes,target,watermark=row['plan']=='free')
+                except Exception as exc:LOG.warning('Photoroom view %s could not be saved for %s (%s)',key,job,type(exc).__name__);continue
+                outputs.append({'name':name,'alt':alt,'kind':'angle'});photoroomViews=True
+        result={'product':product,'description':description,'visibleFeatures':features,'needsConfirmation':confirm,'outputs':outputs,'imageGenerated':generated,'photoroomViews':photoroomViews,'mock':MODE=='mock','plan':row['plan']}
         with db() as c:c.execute("UPDATE jobs SET status='completed',result=? WHERE id=?",(json.dumps(result,ensure_ascii=False),job))
     except Exception as exc:
         # Do not log API request bodies, images, keys, or raw upstream error messages.
