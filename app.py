@@ -295,11 +295,12 @@ def save_output(data:bytes,target:Path,watermark:bool):
 
 # Photoroom "listing images for clothing and apparel" tutorial:
 # https://docs.photoroom.com/tutorials/how-to-create-listing-images-for-clothing-and-apparel
-# One product photo in -> several angle/format variants out, each a separate v2/edit call.
-# background.color is fixed to white on every call so results stay flattenable JPEGs that
-# fit the rest of this pipeline (watermarking, single-file storage, etc.).
-PHOTOROOM_VIEWS=[
-    {'key':'studio','alt':'스튜디오 컷 · 배경 제거','params':{'removeBackground':'true','background.color':'FFFFFF','padding':'0.1','shadow.mode':'ai.soft'}},
+# Photoroom does not invent angles that were never photographed (no side/back view from a
+# single photo) — it restyles a real photo. So every ANGLE shown to buyers must come from a
+# real seller photo (front.jpg, detail.jpg = back), each cleaned up the same way; flat lay /
+# ghost mannequin below are bonus alternate STYLES of the front photo only, not new angles.
+PHOTOROOM_STUDIO_PARAMS={'removeBackground':'true','background.color':'FFFFFF','padding':'0.1','shadow.mode':'ai.soft'}
+PHOTOROOM_EXTRA_VIEWS=[
     {'key':'flatlay','alt':'플랫레이 · 위에서 본 모습','params':{'flatLay.mode':'ai.auto','background.color':'FFFFFF'}},
     {'key':'ghost','alt':'고스트 마네킹 · 핏 강조','params':{'ghostMannequin.mode':'ai.auto','background.color':'FFFFFF'}},
 ]
@@ -318,12 +319,12 @@ def photoroom_edit(data:bytes,params:dict)->bytes:
     response.raise_for_status()
     return response.content
 
-def photoroom_generate_views(data:bytes)->list[tuple[str,str,bytes]]:
-    """Runs the source photo through every configured Photoroom view (studio cutout, flat
-    lay, ghost mannequin). Each view is independent: one failing (rate limit, unsupported
-    image, upstream error) never blocks the others or the rest of the job."""
+def photoroom_generate_extra_views(data:bytes)->list[tuple[str,str,bytes]]:
+    """Runs the front photo through the bonus style views (flat lay, ghost mannequin). Each
+    view is independent: one failing (rate limit, unsupported image, upstream error) never
+    blocks the others or the rest of the job."""
     out=[]
-    for view in PHOTOROOM_VIEWS:
+    for view in PHOTOROOM_EXTRA_VIEWS:
         try:out.append((view['key'],view['alt'],photoroom_edit(data,view['params'])))
         except Exception as exc:LOG.warning('Photoroom view %s failed (%s)',view['key'],type(exc).__name__)
     return out
@@ -353,20 +354,34 @@ def run_job(job):
                 encoded=output.data[0].b64_json
                 if not encoded:raise ValueError('No image output')
                 data=image_bytes(base64.b64decode(encoded));path=folder/'ai-detail.jpg';path.write_bytes(data);sources.append(path);generated=True
-        outputs=[]
-        for i,path in enumerate(sources):
-            name=f'output-{i}.jpg';target=folder/name
-            if row['plan']=='free':add_watermark(path,target)
-            else:target.write_bytes(path.read_bytes())
-            outputs.append({'name':name,'alt':['상품 정면','디테일 원본','AI 디테일 이미지 · 검토 필요'][i],'kind':'main' if i==0 else 'detail'})
-        photoroomViews=False
+        angle_labels=['정면','뒷모습','AI 디테일 이미지 · 검토 필요']
+        outputs=[];photoroomOK=False
         if PHOTOROOM_KEY:
-            for key,alt,img_bytes in photoroom_generate_views(sources[0].read_bytes()):
+            # The real angle photos the seller uploaded (front, back, optionally the AI
+            # close-up) are what buyers see, each just cleaned up to a consistent studio
+            # look — the raw upload itself is never shown when this succeeds.
+            for i,path in enumerate(sources):
+                try:img=photoroom_edit(path.read_bytes(),PHOTOROOM_STUDIO_PARAMS)
+                except Exception as exc:LOG.warning('Photoroom studio pass failed for %s image %d (%s)',job,i,type(exc).__name__);continue
+                name=f'photoroom-{i}.jpg';target=folder/name
+                try:save_output(img,target,watermark=row['plan']=='free')
+                except Exception as exc:LOG.warning('Photoroom output %d could not be saved for %s (%s)',i,job,type(exc).__name__);continue
+                outputs.append({'name':name,'alt':angle_labels[i]+' · 스튜디오 컷','kind':'main' if i==0 else ('ai-detail' if i==2 else 'detail')});photoroomOK=True
+            # Bonus alternate styles of the front photo only (not new angles).
+            for key,alt,img_bytes in photoroom_generate_extra_views(sources[0].read_bytes()):
                 name=f'photoroom-{key}.jpg';target=folder/name
                 try:save_output(img_bytes,target,watermark=row['plan']=='free')
                 except Exception as exc:LOG.warning('Photoroom view %s could not be saved for %s (%s)',key,job,type(exc).__name__);continue
-                outputs.append({'name':name,'alt':alt,'kind':'angle'});photoroomViews=True
-        result={'product':product,'description':description,'visibleFeatures':features,'needsConfirmation':confirm,'outputs':outputs,'imageGenerated':generated,'photoroomViews':photoroomViews,'mock':MODE=='mock','plan':row['plan']}
+                outputs.append({'name':name,'alt':alt,'kind':'angle'})
+        if not photoroomOK:
+            # No Photoroom key, or every Photoroom call failed: fall back to the seller's raw
+            # photos so the listing is never left empty.
+            for i,path in enumerate(sources):
+                name=f'output-{i}.jpg';target=folder/name
+                if row['plan']=='free':add_watermark(path,target)
+                else:target.write_bytes(path.read_bytes())
+                outputs.append({'name':name,'alt':['상품 정면','상품 뒷모습',angle_labels[2]][i],'kind':'main' if i==0 else ('ai-detail' if i==2 else 'detail')})
+        result={'product':product,'description':description,'visibleFeatures':features,'needsConfirmation':confirm,'outputs':outputs,'imageGenerated':generated,'photoroomViews':photoroomOK,'mock':MODE=='mock','plan':row['plan']}
         with db() as c:c.execute("UPDATE jobs SET status='completed',result=? WHERE id=?",(json.dumps(result,ensure_ascii=False),job))
     except Exception as exc:
         # Do not log API request bodies, images, keys, or raw upstream error messages.
