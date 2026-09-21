@@ -297,14 +297,16 @@ def save_output(data:bytes,target:Path,watermark:bool):
 # https://docs.photoroom.com/tutorials/how-to-create-listing-images-for-clothing-and-apparel
 # Photoroom does not invent angles that were never photographed (no side/back view from a
 # single photo) — it restyles a real photo. So every ANGLE shown to buyers comes from a real
-# seller photo (front.jpg, detail.jpg = back). Each gets the "ghost mannequin" treatment —
-# crisp, filled-out, pressed-looking, like it's on an invisible mannequin — not just a plain
-# background cutout, which leaves the garment looking flat/wrinkled the way it was photographed.
-PHOTOROOM_ANGLE_PARAMS={'ghostMannequin.mode':'ai.auto','background.color':'FFFFFF'}
-PHOTOROOM_ANGLE_FALLBACK_PARAMS={'removeBackground':'true','background.color':'FFFFFF','padding':'0.1','shadow.mode':'ai.soft'}
-PHOTOROOM_EXTRA_VIEWS=[
-    {'key':'flatlay','alt':'플랫레이 · 위에서 본 모습','params':{'flatLay.mode':'ai.auto','background.color':'FFFFFF'}},
+# seller photo (front.jpg, detail.jpg = back), and EACH of those two photos gets both styles
+# below: a flat "ironed" cutout and a filled-out ghost-mannequin version. Which source photo
+# an output came from (front vs back) is carried explicitly in its label — never left to be
+# guessed from how the garment happens to look, since a ghost-mannequin render of the back can
+# look front-like once it's filled out in 3D.
+PHOTOROOM_STYLES=[
+    {'key':'flat','suffix':'다림질','params':{'flatLay.mode':'ai.auto','background.color':'FFFFFF'}},
+    {'key':'ghost','suffix':'투명 마네킹','params':{'ghostMannequin.mode':'ai.auto','background.color':'FFFFFF'}},
 ]
+PHOTOROOM_FALLBACK_PARAMS={'removeBackground':'true','background.color':'FFFFFF','padding':'0.1','shadow.mode':'ai.soft'}
 
 def photoroom_edit(data:bytes,params:dict)->bytes:
     """One call to Photoroom's Image Editing API. Raises on failure; caller decides whether
@@ -320,24 +322,14 @@ def photoroom_edit(data:bytes,params:dict)->bytes:
     response.raise_for_status()
     return response.content
 
-def photoroom_angle(data:bytes)->bytes:
-    """Ghost-mannequin styling for one real seller photo (front or back). If Photoroom can't
-    apply ghost mannequin to this particular photo, falls back to a plain background cutout
-    for that one image rather than dropping it entirely; only raises if both fail."""
-    try:return photoroom_edit(data,PHOTOROOM_ANGLE_PARAMS)
+def photoroom_style(data:bytes,params:dict)->bytes:
+    """One styled render of a real seller photo. If Photoroom can't apply this particular
+    style to this particular photo, falls back to a plain background cutout of the same photo
+    rather than dropping it entirely; only raises if both fail."""
+    try:return photoroom_edit(data,params)
     except Exception as exc:
-        LOG.warning('Photoroom ghost mannequin failed, falling back to plain cutout (%s)',type(exc).__name__)
-        return photoroom_edit(data,PHOTOROOM_ANGLE_FALLBACK_PARAMS)
-
-def photoroom_generate_extra_views(data:bytes)->list[tuple[str,str,bytes]]:
-    """Runs the front photo through the bonus style views (currently flat lay). Each view is
-    independent: one failing (rate limit, unsupported image, upstream error) never blocks the
-    others or the rest of the job."""
-    out=[]
-    for view in PHOTOROOM_EXTRA_VIEWS:
-        try:out.append((view['key'],view['alt'],photoroom_edit(data,view['params'])))
-        except Exception as exc:LOG.warning('Photoroom view %s failed (%s)',view['key'],type(exc).__name__)
-    return out
+        LOG.warning('Photoroom style call failed, falling back to plain cutout (%s)',type(exc).__name__)
+        return photoroom_edit(data,PHOTOROOM_FALLBACK_PARAMS)
 
 def run_job(job):
     try:
@@ -364,25 +356,30 @@ def run_job(job):
                 encoded=output.data[0].b64_json
                 if not encoded:raise ValueError('No image output')
                 data=image_bytes(base64.b64decode(encoded));path=folder/'ai-detail.jpg';path.write_bytes(data);sources.append(path);generated=True
-        angle_labels=['정면','뒷모습','AI 디테일 이미지 · 검토 필요']
+        angle_labels=['정면','뒷면','AI 디테일 이미지 · 검토 필요']
         outputs=[];photoroomOK=False
         if PHOTOROOM_KEY:
-            # The real angle photos the seller uploaded (front, back, optionally the AI
-            # close-up) are what buyers see, each pressed into a crisp ghost-mannequin shot —
-            # the raw upload itself is never shown when this succeeds.
-            for i,path in enumerate(sources):
-                try:img=photoroom_angle(path.read_bytes())
-                except Exception as exc:LOG.warning('Photoroom angle pass failed for %s image %d (%s)',job,i,type(exc).__name__);continue
-                name=f'photoroom-{i}.jpg';target=folder/name
-                try:save_output(img,target,watermark=row['plan']=='free')
-                except Exception as exc:LOG.warning('Photoroom output %d could not be saved for %s (%s)',i,job,type(exc).__name__);continue
-                outputs.append({'name':name,'alt':angle_labels[i]+' · 고스트 마네킹','kind':'main' if i==0 else ('ai-detail' if i==2 else 'detail')});photoroomOK=True
-            # Bonus alternate styles of the front photo only (not new angles).
-            for key,alt,img_bytes in photoroom_generate_extra_views(sources[0].read_bytes()):
-                name=f'photoroom-{key}.jpg';target=folder/name
-                try:save_output(img_bytes,target,watermark=row['plan']=='free')
-                except Exception as exc:LOG.warning('Photoroom view %s could not be saved for %s (%s)',key,job,type(exc).__name__);continue
-                outputs.append({'name':name,'alt':alt,'kind':'angle'})
+            # front.jpg and detail.jpg (= back) each get BOTH styles: a flat "ironed" cutout
+            # and a filled-out ghost mannequin. Every alt text spells out which source photo
+            # (정면/뒷면) it came from, since a ghost-mannequin back can look front-like once
+            # it's filled out — the label is what tells them apart, not the silhouette.
+            for i,path in enumerate(sources[:2]):
+                data=path.read_bytes()
+                for style in PHOTOROOM_STYLES:
+                    try:img=photoroom_style(data,style['params'])
+                    except Exception as exc:LOG.warning('Photoroom %s/%s failed for %s (%s)',angle_labels[i],style['key'],job,type(exc).__name__);continue
+                    name=f"photoroom-{i}-{style['key']}.jpg";target=folder/name
+                    try:save_output(img,target,watermark=row['plan']=='free')
+                    except Exception as exc:LOG.warning('Photoroom output %s/%s could not be saved for %s (%s)',i,style['key'],job,type(exc).__name__);continue
+                    outputs.append({'name':name,'alt':f"{angle_labels[i]} · {style['suffix']}",'kind':'main' if i==0 else 'detail'});photoroomOK=True
+            if len(sources)>2:
+                try:img=photoroom_style(sources[2].read_bytes(),PHOTOROOM_STYLES[1]['params'])
+                except Exception as exc:LOG.warning('Photoroom AI-detail pass failed for %s (%s)',job,type(exc).__name__)
+                else:
+                    name='photoroom-2-ghost.jpg';target=folder/name
+                    try:save_output(img,target,watermark=row['plan']=='free')
+                    except Exception as exc:LOG.warning('Photoroom AI-detail output could not be saved for %s (%s)',job,type(exc).__name__)
+                    else:outputs.append({'name':name,'alt':angle_labels[2],'kind':'ai-detail'});photoroomOK=True
         if not photoroomOK:
             # No Photoroom key, or every Photoroom call failed: fall back to the seller's raw
             # photos so the listing is never left empty.
@@ -390,7 +387,7 @@ def run_job(job):
                 name=f'output-{i}.jpg';target=folder/name
                 if row['plan']=='free':add_watermark(path,target)
                 else:target.write_bytes(path.read_bytes())
-                outputs.append({'name':name,'alt':['상품 정면','상품 뒷모습',angle_labels[2]][i],'kind':'main' if i==0 else ('ai-detail' if i==2 else 'detail')})
+                outputs.append({'name':name,'alt':(('상품 '+angle_labels[i]) if i<2 else angle_labels[2]),'kind':'main' if i==0 else ('ai-detail' if i==2 else 'detail')})
         result={'product':product,'description':description,'visibleFeatures':features,'needsConfirmation':confirm,'outputs':outputs,'imageGenerated':generated,'photoroomViews':photoroomOK,'mock':MODE=='mock','plan':row['plan']}
         with db() as c:c.execute("UPDATE jobs SET status='completed',result=? WHERE id=?",(json.dumps(result,ensure_ascii=False),job))
     except Exception as exc:
