@@ -1,0 +1,127 @@
+<!doctype html>
+<html lang="ko"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>THREAD MARKET — 관리자</title><style>
+:root{--blue:#2944e8;--ink:#192124;--muted:#72797f;--line:#e3e6e9;--bg:#f5f6f8}
+*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--ink);font:15px/1.6 -apple-system,BlinkMacSystemFont,'Segoe UI','Noto Sans KR',sans-serif}
+.wrap{max-width:760px;margin:auto;padding:40px 20px}
+h1{font-size:24px;margin:0 0 4px}
+.sub{color:var(--muted);font-size:13px;margin-bottom:28px}
+.card{background:#fff;border:1px solid var(--line);border-radius:12px;padding:22px;margin-bottom:18px}
+label{display:block;font-size:13px;font-weight:600;margin-bottom:6px}
+input{width:100%;padding:10px 12px;border:1px solid #dfe3e8;border-radius:8px;font-size:14px;margin-bottom:14px}
+button{border:0;background:var(--blue);color:#fff;padding:10px 16px;border-radius:8px;font-size:14px;font-weight:650;cursor:pointer}
+button.secondary{background:#fff;color:var(--ink);border:1px solid var(--line)}
+button.danger{background:#c63737}
+button:disabled{opacity:.5;cursor:not-allowed}
+.row{display:flex;align-items:center;justify-content:space-between;gap:12px;padding:14px 0;border-bottom:1px solid var(--line)}
+.row:last-child{border-bottom:0}
+.who{font-size:14px;font-weight:650}
+.meta{font-size:12px;color:var(--muted);margin-top:2px}
+.badge{font-size:11px;padding:3px 8px;border-radius:5px;font-weight:650}
+.badge.pending{background:#fff3d6;color:#8a5a00}
+.badge.approved{background:#e6f4ea;color:#1a7d3c}
+.actions{display:flex;gap:8px;align-items:center}
+.actions input{width:64px;margin:0;padding:8px}
+.error{color:#c63737;font-size:13px;margin-top:8px;min-height:18px}
+.hidden{display:none!important}
+.topbar{display:flex;justify-content:space-between;align-items:center;margin-bottom:20px}
+.empty{color:var(--muted);font-size:14px;padding:20px 0;text-align:center}
+</style></head><body>
+<div class="wrap">
+  <div id="loginView" class="card">
+    <h1>THREAD MARKET 관리자</h1>
+    <p class="sub">관리자 계정으로 로그인하세요.</p>
+    <form id="loginForm">
+      <label for="email">이메일</label><input id="email" type="email" required>
+      <label for="password">비밀번호</label><input id="password" type="password" required>
+      <button type="submit">로그인</button>
+      <div id="loginError" class="error"></div>
+    </form>
+  </div>
+
+  <div id="adminView" class="hidden">
+    <div class="topbar">
+      <div><h1 style="margin-bottom:0">판매자 승인</h1><p class="sub" id="whoami" style="margin:4px 0 0"></p></div>
+      <button class="secondary" id="logoutBtn">로그아웃</button>
+    </div>
+    <div class="card">
+      <div id="sellerList"></div>
+      <div id="listEmpty" class="empty hidden">가입한 판매자가 없습니다.</div>
+    </div>
+    <div id="adminError" class="error"></div>
+  </div>
+</div>
+<script>
+'use strict';
+const $=s=>document.querySelector(s);
+async function api(path,options={}){
+  const res=await fetch(path,{...options,credentials:'include',headers:{'Content-Type':'application/json',Accept:'application/json',...options.headers}});
+  let data;try{data=await res.json()}catch{data=null}
+  if(!res.ok)throw new Error(data?.error?.message||('요청 실패 (HTTP '+res.status+')'));
+  return data;
+}
+function fmtDate(iso){try{return new Date(iso).toLocaleString('ko-KR')}catch{return iso}}
+
+async function checkSession(){
+  try{
+    const {user}=await api('/api/auth/me');
+    if(user.role!=='admin'){showLogin('관리자 계정이 아닙니다.');return}
+    showAdmin(user);
+  }catch{showLogin()}
+}
+function showLogin(err){
+  $('#loginView').classList.remove('hidden');$('#adminView').classList.add('hidden');
+  if(err)$('#loginError').textContent=err;
+}
+async function showAdmin(user){
+  $('#loginView').classList.add('hidden');$('#adminView').classList.remove('hidden');
+  $('#whoami').textContent=user.name+' ('+user.email+')';
+  await loadSellers();
+}
+async function loadSellers(){
+  $('#adminError').textContent='';
+  try{
+    const {sellers}=await api('/api/admin/sellers');
+    const list=$('#sellerList');list.innerHTML='';
+    $('#listEmpty').classList.toggle('hidden',sellers.length>0);
+    for(const s of sellers){
+      const row=document.createElement('div');row.className='row';
+      row.innerHTML=`
+        <div>
+          <div class="who">${escapeHTML(s.name)} <span class="badge ${s.approved?'approved':'pending'}">${s.approved?'승인됨':'대기중'}</span>${s.paidUntil?' <span class="badge approved">유료 이용중</span>':''}</div>
+          <div class="meta">${escapeHTML(s.email)} · 가입 ${fmtDate(s.created)}</div>
+        </div>
+        <div class="actions">
+          ${s.approved
+            ? `<button class="secondary" data-act="revoke">승인 취소</button>`
+            : `<button data-act="approve">승인</button>`}
+          <input type="number" min="1" max="365" value="30" data-days>
+          <button class="secondary" data-act="grant">유료 부여</button>
+        </div>`;
+      row.querySelector('[data-act="approve"]')?.addEventListener('click',()=>act(s.id,'approve'));
+      row.querySelector('[data-act="revoke"]')?.addEventListener('click',()=>act(s.id,'revoke'));
+      row.querySelector('[data-act="grant"]').addEventListener('click',()=>act(s.id,'grant-paid',{days:Number(row.querySelector('[data-days]').value)}));
+      list.appendChild(row);
+    }
+  }catch(e){$('#adminError').textContent=e.message}
+}
+async function act(id,action,body){
+  $('#adminError').textContent='';
+  try{
+    await api('/api/admin/sellers/'+id+'/'+action,{method:'POST',body:body?JSON.stringify(body):undefined});
+    await loadSellers();
+  }catch(e){$('#adminError').textContent=e.message}
+}
+function escapeHTML(s){return String(s).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]))}
+
+$('#loginForm').addEventListener('submit',async e=>{
+  e.preventDefault();$('#loginError').textContent='';
+  try{
+    const {user}=await api('/api/auth/login',{method:'POST',body:JSON.stringify({email:$('#email').value.trim(),password:$('#password').value})});
+    if(user.role!=='admin'){$('#loginError').textContent='관리자 계정이 아닙니다.';return}
+    showAdmin(user);
+  }catch(e){$('#loginError').textContent=e.message}
+});
+$('#logoutBtn').addEventListener('click',async()=>{await api('/api/auth/logout',{method:'POST'});showLogin()});
+checkSession();
+</script>
+</body></html>

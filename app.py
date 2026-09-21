@@ -84,6 +84,9 @@ def current_user(request:Request):
 def seller(user=Depends(current_user)):
     if user['role']!='seller' or not user['approved']:raise HTTPException(403,'관리자 승인된 판매자 계정이 필요합니다.')
     return user
+def admin(user=Depends(current_user)):
+    if user['role']!='admin':raise HTTPException(403,'관리자 계정이 필요합니다.')
+    return user
 
 def password_hash(password,salt=None):
     salt=salt or secrets.token_bytes(16)
@@ -421,6 +424,40 @@ def place_order(user=Depends(current_user)):
     raise HTTPException(503,'실제 주문·결제 기능은 PG 결제 및 웹훅 연동 후 활성화할 수 있습니다.')
 @app.get('/api/orders')
 def list_orders(user=Depends(current_user)):return {'orders':[]}
+
+@app.get('/api/admin/sellers')
+def admin_sellers(user=Depends(admin)):
+    with db() as c:
+        rows=c.execute("SELECT id,email,name,approved,created FROM users WHERE role='seller' ORDER BY created DESC LIMIT 200").fetchall()
+        paid={r['user_id']:r['paid_until'] for r in c.execute('SELECT user_id,paid_until FROM entitlements').fetchall()}
+    now_ts=time.time()
+    return {'sellers':[{'id':r['id'],'email':r['email'],'name':r['name'],'approved':bool(r['approved']),'created':r['created'],'paidUntil':paid.get(r['id']) and paid[r['id']]>now_ts} for r in rows]}
+@app.post('/api/admin/sellers/{user_id}/approve')
+def admin_approve(user_id:str,user=Depends(admin)):
+    with db() as c:changed=c.execute("UPDATE users SET approved=1 WHERE id=? AND role='seller'",(user_id,)).rowcount
+    if not changed:raise HTTPException(404,'판매자를 찾을 수 없습니다.')
+    return {'ok':True}
+@app.post('/api/admin/sellers/{user_id}/revoke')
+def admin_revoke(user_id:str,user=Depends(admin)):
+    with db() as c:changed=c.execute("UPDATE users SET approved=0 WHERE id=? AND role='seller'",(user_id,)).rowcount
+    if not changed:raise HTTPException(404,'판매자를 찾을 수 없습니다.')
+    return {'ok':True}
+class GrantPaid(BaseModel):
+    model_config=ConfigDict(extra='forbid')
+    days:int=Field(ge=1,le=365,strict=True)
+@app.post('/api/admin/sellers/{user_id}/grant-paid')
+def admin_grant_paid(user_id:str,body:GrantPaid,user=Depends(admin)):
+    with db() as c:
+        row=c.execute("SELECT id FROM users WHERE id=? AND role='seller'",(user_id,)).fetchone()
+        if not row:raise HTTPException(404,'판매자를 찾을 수 없습니다.')
+        c.execute('INSERT INTO entitlements VALUES(?,?) ON CONFLICT(user_id) DO UPDATE SET paid_until=excluded.paid_until',(user_id,time.time()+86400*body.days))
+    return {'ok':True}
+
+@app.get('/admin',response_class=HTMLResponse)
+def admin_page():
+    path=ROOT/'public'/'admin.html'
+    if not path.exists():return HTMLResponse('<h1>관리자 페이지 파일이 없습니다.</h1>')
+    return HTMLResponse(path.read_text(encoding='utf-8'))
 
 @app.get('/',response_class=HTMLResponse)
 def homepage():
