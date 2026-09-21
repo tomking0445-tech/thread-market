@@ -44,8 +44,18 @@ button:disabled{opacity:.5;cursor:not-allowed}
       <button class="secondary" id="logoutBtn">로그아웃</button>
     </div>
     <div class="card">
+      <h3 style="margin:0 0 10px">판매자 승인</h3>
       <div id="sellerList"></div>
       <div id="listEmpty" class="empty hidden">가입한 판매자가 없습니다.</div>
+    </div>
+    <div class="card">
+      <h3 style="margin:0 0 10px">전체 회원 · 권한 관리</h3>
+      <div id="userList"></div>
+    </div>
+    <div class="card">
+      <h3 style="margin:0 0 10px">게시된 상품 관리</h3>
+      <div id="productList"></div>
+      <div id="productEmpty" class="empty hidden">게시된 상품이 없습니다.</div>
     </div>
     <div id="adminError" class="error"></div>
   </div>
@@ -75,7 +85,7 @@ function showLogin(err){
 async function showAdmin(user){
   $('#loginView').classList.add('hidden');$('#adminView').classList.remove('hidden');
   $('#whoami').textContent=user.name+' ('+user.email+')';
-  await loadSellers();
+  await Promise.all([loadSellers(),loadUsers(),loadProducts()]);
 }
 async function loadSellers(){
   $('#adminError').textContent='';
@@ -108,10 +118,77 @@ async function act(id,action,body){
   $('#adminError').textContent='';
   try{
     await api('/api/admin/sellers/'+id+'/'+action,{method:'POST',body:body?JSON.stringify(body):undefined});
-    await loadSellers();
+    await Promise.all([loadSellers(),loadUsers()]);
   }catch(e){$('#adminError').textContent=e.message}
 }
 function escapeHTML(s){return String(s).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]))}
+
+const ROLE_LABEL={customer:'구매자',seller:'판매자',admin:'관리자'};
+async function loadUsers(){
+  try{
+    const {users}=await api('/api/admin/users');
+    const list=$('#userList');list.innerHTML='';
+    for(const u of users){
+      const row=document.createElement('div');row.className='row';
+      row.innerHTML=`
+        <div>
+          <div class="who">${escapeHTML(u.name)} <span class="badge approved">${ROLE_LABEL[u.role]||u.role}</span></div>
+          <div class="meta">${escapeHTML(u.email)} · 가입 ${fmtDate(u.created)}</div>
+        </div>
+        <div class="actions">
+          <select data-role>
+            <option value="customer" ${u.role==='customer'?'selected':''}>구매자</option>
+            <option value="seller" ${u.role==='seller'?'selected':''}>판매자</option>
+            <option value="admin" ${u.role==='admin'?'selected':''}>관리자</option>
+          </select>
+          <button class="secondary" data-apply>적용</button>
+        </div>`;
+      row.querySelector('[data-apply]').addEventListener('click',async()=>{
+        $('#adminError').textContent='';
+        try{
+          await api('/api/admin/users/'+u.id+'/role',{method:'POST',body:JSON.stringify({role:row.querySelector('[data-role]').value})});
+          await Promise.all([loadUsers(),loadSellers()]);
+        }catch(e){$('#adminError').textContent=e.message}
+      });
+      list.appendChild(row);
+    }
+  }catch(e){$('#adminError').textContent=e.message}
+}
+
+async function loadProducts(){
+  try{
+    const {products}=await api('/api/admin/products');
+    const list=$('#productList');list.innerHTML='';
+    $('#productEmpty').classList.toggle('hidden',products.length>0);
+    for(const p of products){
+      const row=document.createElement('div');row.className='row';
+      row.innerHTML=`
+        <div>
+          <div class="who">${escapeHTML(p.name)}</div>
+          <div class="meta">${escapeHTML(p.sellerEmail)} · 재고 ${p.stock} · ${p.price.toLocaleString()}원</div>
+        </div>
+        <div class="actions">
+          <input type="number" min="100" data-price value="${p.price}" style="width:90px">
+          <input type="number" min="0" data-stock value="${p.stock}" style="width:64px">
+          <button class="secondary" data-save>저장</button>
+          <button class="danger" data-del>삭제</button>
+        </div>`;
+      row.querySelector('[data-save]').addEventListener('click',async()=>{
+        $('#adminError').textContent='';
+        try{
+          await api('/api/admin/products/'+p.id,{method:'PATCH',body:JSON.stringify({price:Number(row.querySelector('[data-price]').value),stock:Number(row.querySelector('[data-stock]').value)})});
+          await loadProducts();
+        }catch(e){$('#adminError').textContent=e.message}
+      });
+      row.querySelector('[data-del]').addEventListener('click',async()=>{
+        if(!confirm('이 상품을 삭제할까요?'))return;
+        $('#adminError').textContent='';
+        try{await api('/api/admin/products/'+p.id,{method:'DELETE'});await loadProducts()}catch(e){$('#adminError').textContent=e.message}
+      });
+      list.appendChild(row);
+    }
+  }catch(e){$('#adminError').textContent=e.message}
+}
 
 $('#loginForm').addEventListener('submit',async e=>{
   e.preventDefault();$('#loginError').textContent='';

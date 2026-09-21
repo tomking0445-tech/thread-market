@@ -462,6 +462,48 @@ def admin_grant_paid(user_id:str,body:GrantPaid,user=Depends(admin)):
         c.execute('INSERT INTO entitlements VALUES(?,?) ON CONFLICT(user_id) DO UPDATE SET paid_until=excluded.paid_until',(user_id,time.time()+86400*body.days))
     return {'ok':True}
 
+@app.get('/api/admin/users')
+def admin_users(user=Depends(admin)):
+    with db() as c:rows=c.execute('SELECT id,email,name,role,approved,created FROM users ORDER BY created DESC LIMIT 500').fetchall()
+    return {'users':[{'id':r['id'],'email':r['email'],'name':r['name'],'role':r['role'],'approved':bool(r['approved']),'created':r['created']} for r in rows]}
+class RoleChange(BaseModel):
+    model_config=ConfigDict(extra='forbid')
+    role:Literal['customer','seller','admin']
+@app.post('/api/admin/users/{user_id}/role')
+def admin_set_role(user_id:str,body:RoleChange,user=Depends(admin)):
+    with db() as c:
+        row=c.execute('SELECT approved FROM users WHERE id=?',(user_id,)).fetchone()
+        if not row:raise HTTPException(404,'사용자를 찾을 수 없습니다.')
+        approved=1 if body.role in ('admin','seller') else row['approved']
+        c.execute('UPDATE users SET role=?,approved=? WHERE id=?',(body.role,approved,user_id))
+    return {'ok':True}
+
+@app.get('/api/admin/products')
+def admin_products(user=Depends(admin)):
+    with db() as c:rows=c.execute('SELECT p.id,p.data,p.created,u.email AS seller_email FROM products p JOIN users u ON u.id=p.seller_id ORDER BY p.created DESC LIMIT 500').fetchall()
+    return {'products':[{**json.loads(r['data']),'sellerEmail':r['seller_email']} for r in rows]}
+class ProductEdit(BaseModel):
+    model_config=ConfigDict(extra='forbid')
+    name:str|None=Field(default=None,min_length=1,max_length=100)
+    price:int|None=Field(default=None,ge=100,le=100000000,strict=True)
+    stock:int|None=Field(default=None,ge=0,le=99999,strict=True)
+    description:str|None=Field(default=None,max_length=4000)
+@app.patch('/api/admin/products/{product_id}')
+def admin_edit_product(product_id:str,body:ProductEdit,user=Depends(admin)):
+    changes={k:v for k,v in body.model_dump().items() if v is not None}
+    if not changes:raise HTTPException(422,'변경할 값이 없습니다.')
+    with db() as c:
+        row=c.execute('SELECT data FROM products WHERE id=?',(product_id,)).fetchone()
+        if not row:raise HTTPException(404,'상품을 찾을 수 없습니다.')
+        data=json.loads(row['data']);data.update(changes)
+        c.execute('UPDATE products SET data=? WHERE id=?',(json.dumps(data,ensure_ascii=False),product_id))
+    return {'product':data}
+@app.delete('/api/admin/products/{product_id}')
+def admin_delete_product(product_id:str,user=Depends(admin)):
+    with db() as c:changed=c.execute('DELETE FROM products WHERE id=?',(product_id,)).rowcount
+    if not changed:raise HTTPException(404,'상품을 찾을 수 없습니다.')
+    return {'ok':True}
+
 @app.get('/admin',response_class=HTMLResponse)
 def admin_page():
     path=ROOT/'public'/'admin.html'
