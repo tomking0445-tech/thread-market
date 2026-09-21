@@ -296,13 +296,14 @@ def save_output(data:bytes,target:Path,watermark:bool):
 # Photoroom "listing images for clothing and apparel" tutorial:
 # https://docs.photoroom.com/tutorials/how-to-create-listing-images-for-clothing-and-apparel
 # Photoroom does not invent angles that were never photographed (no side/back view from a
-# single photo) — it restyles a real photo. So every ANGLE shown to buyers must come from a
-# real seller photo (front.jpg, detail.jpg = back), each cleaned up the same way; flat lay /
-# ghost mannequin below are bonus alternate STYLES of the front photo only, not new angles.
-PHOTOROOM_STUDIO_PARAMS={'removeBackground':'true','background.color':'FFFFFF','padding':'0.1','shadow.mode':'ai.soft'}
+# single photo) — it restyles a real photo. So every ANGLE shown to buyers comes from a real
+# seller photo (front.jpg, detail.jpg = back). Each gets the "ghost mannequin" treatment —
+# crisp, filled-out, pressed-looking, like it's on an invisible mannequin — not just a plain
+# background cutout, which leaves the garment looking flat/wrinkled the way it was photographed.
+PHOTOROOM_ANGLE_PARAMS={'ghostMannequin.mode':'ai.auto','background.color':'FFFFFF'}
+PHOTOROOM_ANGLE_FALLBACK_PARAMS={'removeBackground':'true','background.color':'FFFFFF','padding':'0.1','shadow.mode':'ai.soft'}
 PHOTOROOM_EXTRA_VIEWS=[
     {'key':'flatlay','alt':'플랫레이 · 위에서 본 모습','params':{'flatLay.mode':'ai.auto','background.color':'FFFFFF'}},
-    {'key':'ghost','alt':'고스트 마네킹 · 핏 강조','params':{'ghostMannequin.mode':'ai.auto','background.color':'FFFFFF'}},
 ]
 
 def photoroom_edit(data:bytes,params:dict)->bytes:
@@ -319,10 +320,19 @@ def photoroom_edit(data:bytes,params:dict)->bytes:
     response.raise_for_status()
     return response.content
 
+def photoroom_angle(data:bytes)->bytes:
+    """Ghost-mannequin styling for one real seller photo (front or back). If Photoroom can't
+    apply ghost mannequin to this particular photo, falls back to a plain background cutout
+    for that one image rather than dropping it entirely; only raises if both fail."""
+    try:return photoroom_edit(data,PHOTOROOM_ANGLE_PARAMS)
+    except Exception as exc:
+        LOG.warning('Photoroom ghost mannequin failed, falling back to plain cutout (%s)',type(exc).__name__)
+        return photoroom_edit(data,PHOTOROOM_ANGLE_FALLBACK_PARAMS)
+
 def photoroom_generate_extra_views(data:bytes)->list[tuple[str,str,bytes]]:
-    """Runs the front photo through the bonus style views (flat lay, ghost mannequin). Each
-    view is independent: one failing (rate limit, unsupported image, upstream error) never
-    blocks the others or the rest of the job."""
+    """Runs the front photo through the bonus style views (currently flat lay). Each view is
+    independent: one failing (rate limit, unsupported image, upstream error) never blocks the
+    others or the rest of the job."""
     out=[]
     for view in PHOTOROOM_EXTRA_VIEWS:
         try:out.append((view['key'],view['alt'],photoroom_edit(data,view['params'])))
@@ -358,15 +368,15 @@ def run_job(job):
         outputs=[];photoroomOK=False
         if PHOTOROOM_KEY:
             # The real angle photos the seller uploaded (front, back, optionally the AI
-            # close-up) are what buyers see, each just cleaned up to a consistent studio
-            # look — the raw upload itself is never shown when this succeeds.
+            # close-up) are what buyers see, each pressed into a crisp ghost-mannequin shot —
+            # the raw upload itself is never shown when this succeeds.
             for i,path in enumerate(sources):
-                try:img=photoroom_edit(path.read_bytes(),PHOTOROOM_STUDIO_PARAMS)
-                except Exception as exc:LOG.warning('Photoroom studio pass failed for %s image %d (%s)',job,i,type(exc).__name__);continue
+                try:img=photoroom_angle(path.read_bytes())
+                except Exception as exc:LOG.warning('Photoroom angle pass failed for %s image %d (%s)',job,i,type(exc).__name__);continue
                 name=f'photoroom-{i}.jpg';target=folder/name
                 try:save_output(img,target,watermark=row['plan']=='free')
                 except Exception as exc:LOG.warning('Photoroom output %d could not be saved for %s (%s)',i,job,type(exc).__name__);continue
-                outputs.append({'name':name,'alt':angle_labels[i]+' · 스튜디오 컷','kind':'main' if i==0 else ('ai-detail' if i==2 else 'detail')});photoroomOK=True
+                outputs.append({'name':name,'alt':angle_labels[i]+' · 고스트 마네킹','kind':'main' if i==0 else ('ai-detail' if i==2 else 'detail')});photoroomOK=True
             # Bonus alternate styles of the front photo only (not new angles).
             for key,alt,img_bytes in photoroom_generate_extra_views(sources[0].read_bytes()):
                 name=f'photoroom-{key}.jpg';target=folder/name
