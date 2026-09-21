@@ -63,6 +63,15 @@ def init_db(recover=True):
         if recover:
             c.execute("UPDATE jobs SET status='failed',error=? WHERE status IN ('queued','processing')",('서버 재시작으로 작업이 중단됐습니다. 관리자에게 확인 후 다시 요청해 주세요.',))
         c.execute('DELETE FROM sessions WHERE expires<?',(time.time(),))
+        # Optional bootstrap admin, set only via Railway env vars (never in source/GitHub).
+        admin_email=os.getenv('ADMIN_EMAIL','').strip().lower()
+        admin_password=os.getenv('ADMIN_PASSWORD','')
+        if admin_email and admin_password:
+            existing=c.execute('SELECT id FROM users WHERE email=?',(admin_email,)).fetchone()
+            if existing:
+                c.execute("UPDATE users SET role='admin',approved=1,password=? WHERE id=?",(password_hash(admin_password),existing['id']))
+            else:
+                c.execute('INSERT INTO users VALUES(?,?,?,?,?,?,?)',(uid('usr'),admin_email,'Admin',password_hash(admin_password),'admin',1,now()))
 
 def rate(key,limit,window):
     with RATE_LOCK:
