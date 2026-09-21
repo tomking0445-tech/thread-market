@@ -297,16 +297,20 @@ def save_output(data:bytes,target:Path,watermark:bool):
 # https://docs.photoroom.com/tutorials/how-to-create-listing-images-for-clothing-and-apparel
 # Photoroom does not invent angles that were never photographed (no side/back view from a
 # single photo) — it restyles a real photo. So every ANGLE shown to buyers comes from a real
-# seller photo (front.jpg, detail.jpg = back), and EACH of those two photos gets both styles
-# below: a flat "ironed" cutout and a filled-out ghost-mannequin version. Which source photo
-# an output came from (front vs back) is carried explicitly in its label — never left to be
-# guessed from how the garment happens to look, since a ghost-mannequin render of the back can
-# look front-like once it's filled out in 3D.
-PHOTOROOM_STYLES=[
+# seller photo (front.jpg, detail.jpg = back). ghostMannequin.mode normalizes almost any input
+# toward a front-presentable collared shape, so it is only trustworthy on the FRONT photo — on
+# a back photo it can render a collar that was never actually visible from behind. The back
+# photo therefore gets two orientation-preserving styles instead (flat lay + plain cutout),
+# never ghost mannequin.
+PHOTOROOM_FRONT_STYLES=[
     {'key':'flat','suffix':'다림질','params':{'flatLay.mode':'ai.auto','background.color':'FFFFFF'}},
     {'key':'ghost','suffix':'투명 마네킹','params':{'ghostMannequin.mode':'ai.auto','background.color':'FFFFFF'}},
 ]
 PHOTOROOM_FALLBACK_PARAMS={'removeBackground':'true','background.color':'FFFFFF','padding':'0.1','shadow.mode':'ai.soft'}
+PHOTOROOM_BACK_STYLES=[
+    {'key':'flat','suffix':'다림질','params':{'flatLay.mode':'ai.auto','background.color':'FFFFFF'}},
+    {'key':'studio','suffix':'스튜디오 컷','params':PHOTOROOM_FALLBACK_PARAMS},
+]
 
 def photoroom_edit(data:bytes,params:dict)->bytes:
     """One call to Photoroom's Image Editing API. Raises on failure; caller decides whether
@@ -365,7 +369,7 @@ def run_job(job):
             # it's filled out — the label is what tells them apart, not the silhouette.
             for i,path in enumerate(sources[:2]):
                 data=path.read_bytes()
-                for style in PHOTOROOM_STYLES:
+                for style in (PHOTOROOM_FRONT_STYLES if i==0 else PHOTOROOM_BACK_STYLES):
                     try:img=photoroom_style(data,style['params'])
                     except Exception as exc:LOG.warning('Photoroom %s/%s failed for %s (%s)',angle_labels[i],style['key'],job,type(exc).__name__);continue
                     name=f"photoroom-{i}-{style['key']}.jpg";target=folder/name
@@ -373,7 +377,7 @@ def run_job(job):
                     except Exception as exc:LOG.warning('Photoroom output %s/%s could not be saved for %s (%s)',i,style['key'],job,type(exc).__name__);continue
                     outputs.append({'name':name,'alt':f"{angle_labels[i]} · {style['suffix']}",'kind':'main' if i==0 else 'detail'});photoroomOK=True
             if len(sources)>2:
-                try:img=photoroom_style(sources[2].read_bytes(),PHOTOROOM_STYLES[1]['params'])
+                try:img=photoroom_style(sources[2].read_bytes(),PHOTOROOM_FRONT_STYLES[1]['params'])
                 except Exception as exc:LOG.warning('Photoroom AI-detail pass failed for %s (%s)',job,type(exc).__name__)
                 else:
                     name='photoroom-2-ghost.jpg';target=folder/name
