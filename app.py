@@ -354,20 +354,16 @@ def run_job(job):
         outputs=[];photoroomOK=False
         if PHOTOROOM_KEY:
             front_bytes=sources[0].read_bytes();back_bytes=sources[1].read_bytes()
-            # Fixed order: front ironed, back ironed, front ghost mannequin, male model,
-            # female model, then our own side-by-side composite of the two model shots.
+            # Fixed order: front ironed, back ironed, front ghost mannequin. Each call falls
+            # back to a plain cutout of the SAME photo if its AI style fails outright, so a
+            # back flatLay call that errors out never turns into a front-looking image.
             fixed_steps=[
                 ('0-flat',front_bytes,PHOTOROOM_FLAT_PARAMS,'정면 · 다림질','main'),
+                ('1-flat',back_bytes,PHOTOROOM_FLAT_PARAMS,'뒷면 · 다림질','detail'),
                 ('0-ghost',front_bytes,PHOTOROOM_GHOST_PARAMS,'정면 · 투명 마네킹','angle'),
-                # Back photo: plain cutout ONLY. flatLay and ghostMannequin both proved
-                # unreliable on the back photo in testing — they normalize toward a
-                # front-presentable collared shape, so a genuinely rear-facing photo can come
-                # back looking like the front again. A plain cutout can't invent a shape.
-                ('1-cutout',back_bytes,PHOTOROOM_FALLBACK_PARAMS,'뒷면 · 스튜디오 컷','detail'),
             ]
             for key,data,params,alt,kind in fixed_steps:
-                call=photoroom_edit if key=='1-cutout' else photoroom_style
-                try:img=call(data,params)
+                try:img=photoroom_style(data,params)
                 except Exception as exc:LOG.warning('Photoroom %s failed for %s (%s)',key,job,type(exc).__name__);continue
                 name=f'photoroom-{key}.jpg';target=folder/name
                 try:save_output(img,target,watermark=row['plan']=='free')
